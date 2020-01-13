@@ -1,42 +1,47 @@
-from proxmin import nmf
-from proxmin.utils import Traceback
-from proxmin import operators as po
-from scipy.optimize import linear_sum_assignment
+# from proxmin import nmf
 import numpy as np
+import proxmin
+from proxmin.utils import Traceback
+from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
-import time
+import time, sys
 from functools import partial
 
 # initialize and run NMF
 import logging
+
 logging.basicConfig()
-logger = logging.getLogger('proxmin')
+logger = logging.getLogger("proxmin")
 logger.setLevel(logging.INFO)
+
 
 def generateComponent(m):
     """Creates oscillating components to be mixed"""
-    freq = 25*np.random.random()
-    phase = 2*np.pi*np.random.random()
+    freq = 25 * np.random.random()
+    phase = 2 * np.pi * np.random.random()
     x = np.arange(m)
-    return np.cos(x/freq-phase)**2
+    return np.cos(x / freq - phase) ** 2
+
 
 def generateAmplitudes(k):
     """Makes mixing coefficients"""
     res = np.array([np.random.random() for i in range(k)])
-    return res/res.sum()
+    return res / res.sum()
+
 
 def add_noise(Y, sigma):
     """Adds noise to Y"""
     return Y + np.random.normal(0, sigma, Y.shape)
 
+
 def match(A, S, trueS):
     """Rearranges columns of S to best fit the components they likely represent (maximizes sum of correlations)"""
     cov = np.cov(trueS, S)
     k = S.shape[0]
-    corr = np.zeros([k,k])
+    corr = np.zeros([k, k])
     for i in range(k):
         for j in range(k):
-            corr[i][j] = cov[i + k][j]/np.sqrt(cov[i + k][i + k]*cov[j][j])
+            corr[i][j] = cov[i + k][j] / np.sqrt(cov[i + k][i + k] * cov[j][j])
     arrangement = linear_sum_assignment(-corr)
     resS = np.zeros_like(S)
     resAT = np.zeros_like(A.T)
@@ -45,84 +50,120 @@ def match(A, S, trueS):
         resAT[arrangement[1][t]] = A.T[arrangement[0][t]]
     return resAT.T, resS
 
+
+def plotData(trueS, Y, S):
+
+    # show data and model
+    fig, axs = plt.subplots(1, 3, sharey=True)
+    axs[0].plot(trueS.T)
+    axs[1].plot(Y.T, c="k", alpha=0.15)
+    axs[2].plot(S.T)
+    axs[0].set_xlabel("Feature")
+    axs[1].set_xlabel("Feature")
+    axs[2].set_xlabel("Feature")
+    axs[0].text(0.03, 0.97, "True S", ha="left", va="top", transform=axs[0].transAxes)
+    axs[1].text(0.03, 0.97, "Y", ha="left", va="top", transform=axs[1].transAxes)
+    axs[2].text(
+        0.03, 0.97, "Best-fit S", ha="left", va="top", transform=axs[2].transAxes
+    )
+    axs[0].set_ylim(top=1.1)
+    axs[1].set_ylim(top=1.1)
+    axs[2].set_ylim(top=1.1)
+    fig.subplots_adjust(wspace=0)
+    fig.tight_layout()
+    fig.show()
+
+
+def plotLoss(trace, Y, ax=None, label=None):
+
+    # convergence plot from traceback
+    loss = []
+    feasible = []
+    for At, St in traceback.trace:
+        loss.append(proxmin.nmf.log_likelihood(At, St, Y=Y))
+
+    if ax is None:
+        fig = plt.figure()
+        ax = fig.add_subplot(111)
+    ax.semilogy(loss, label=label)
+
+
 if __name__ == "__main__":
-    n = 50 			# component resolution
-    k = 3 			# number of components
-    b = 100			# number of observations
-    noise = 0.02    # stdev of added noise
+
+    if len(sys.argv) == 2:
+        problem = sys.argv[1]
+        if problem not in ["nmf", "mixmf"]:
+            raise ValueError("Expected either 'nmf' or 'mixmf' as an argument")
+    else:
+        problem = "mixmf"
+
+    n = 50  # component resolution
+    k = 3  # number of components
+    b = 100  # number of observations
+    noise = 0.02  # stdev of added noise
     np.random.seed(101)
 
     # set up test data
     trueA = np.array([generateAmplitudes(k) for i in range(b)])
     trueS = np.array([generateComponent(n) for i in range(k)])
-    trueY = np.dot(trueA,trueS)
-    Y = add_noise(trueY, noise)
-    # if noise is variable, specify variance matrix of the same shape as Y
-    W = None
+    Y = add_noise(np.dot(trueA, trueS), noise)
 
-    A = np.array([generateAmplitudes(k) for i in range(b)])
-    S = np.array([generateComponent(n) for i in range(k)])
-    p1 = partial(po.prox_unity_plus, axis=1)
-    proxs_g=[[p1], None]
-    tr = Traceback(2)
-    nmf(Y, A, S, W=W, prox_A=p1, e_rel=1e-6, e_abs=1e-6/noise**2, traceback=tr)
-    # sort components to best match inputs
-    A, S = match(A, S, trueS)
+    A0 = np.random.rand(b, k)
+    A0 /= A0.sum(axis=1)[:, None]
+    S0 = np.random.rand(k, n)
 
-    # show data and model
-    fig = plt.figure(figsize=(6,7))
-    ax = fig.add_subplot(311)
-    ax.set_title("True Components S")
-    ax.plot(trueS.T)
-    ax2 = fig.add_subplot(312)
-    ax2.set_title("Data Y")
-    ax2.plot(Y.T)
-    ax3 = fig.add_subplot(313)
-    ax3.set_title("Found Components S")
-    ax3.set_xlabel("Pixel")
-    ax3.plot(S.T)
-    fig.subplots_adjust(bottom=0.07, top=0.95, hspace=0.35)
-    fig.show()
+    # mixture model: amplitudes positive
+    # and sum up to one at every pixel
+    pA = partial(proxmin.operators.prox_unity_plus, axis=1)
+    pS = proxmin.operators.prox_plus
 
-    # convergence plot from traceback
-    convergences = []
-    As = tr['X',0]
-    Ss = tr['X',1]
-    for it in range(tr.it):
-        Y = np.dot(As[it], Ss[it])
-        convergences.append(((Y - trueY)**2).sum())
-    fig2 = plt.figure(figsize=(6,4))
-    ax4 = fig2.add_subplot(111)
-    ax4.set_title("Convergence")
-    ax4.semilogy(convergences)
-    ax4.set_ylabel("$||Y-AS||^2$")
-    ax4.set_xlabel("Iterations")
-    fig2.show()
+    if problem == "nmf":
+        prox = [pS, pS]
+    elif problem == "mixmf":
+        prox = [pA, pS]
 
-    """
-    # noise plot
-    #noises = np.linspace(0,0.05,21)
-    #repeat = 10
-    noises = [noise]
-    repeat = 1000
-    A_chi_squared = np.empty((len(noises), repeat))
-    S_chi_squared = np.empty((len(noises), repeat))
-    for i in range(len(noises)):
-        e = noises[i]
-        for r in range(repeat):
-            Y = add_noise(trueY, e)
-            A, S = nmf.nmf(Y, A0, S0, e_rel=1e-4, e_abs=1e-4, )
-            A, S = match(A, S, trueS)
-            A_chi_squared[i,r] = np.sum((A - trueA)**2)
-            S_chi_squared[i,r] = np.sum((S - trueS)**2)
-    fig3 = plt.figure(figsize=(6,4))
-    ax5 = fig3.add_subplot(111)
-    dof_A = A.shape[0]*A.shape[1]
-    dof_S = S.shape[0]*S.shape[1]
-    ax5.errorbar(noises, S_chi_squared.mean(axis=1)/dof_S, yerr=S_chi_squared.std(axis=1)/dof_S, label="$\chi^2_S$ / DOF")
-    ax5.errorbar(noises, A_chi_squared.mean(axis=1)/dof_A, yerr=A_chi_squared.std(axis=1)/dof_A, label="$\chi^2_A$ / DOF")
-    ax5.legend()
-    ax5.set_ylabel("Chi-squared")
-    ax5.set_xlabel("Standard deviation of noise")
-    fig3.show()
-    """
+    grad = partial(proxmin.nmf.grad_likelihood, Y=Y)
+
+    traceback = Traceback()
+    all_args = {"prox": prox, "max_iter": 1000, "callback": traceback, "e_rel": 1e-4}
+    b1 = 0.9
+    b2 = 0.999
+    adaprox_args = {"b1": b1, "b2": b2, "prox_max_iter": 100}
+    runs = (
+        (proxmin.pgm, all_args, "PGM"),
+        (proxmin.adaprox, dict(all_args, **adaprox_args, scheme="adam"), "Adam"),
+        (
+            proxmin.adaprox,
+            dict(all_args, **adaprox_args, scheme="padam", p=0.125),
+            "PAdam",
+        ),
+        (proxmin.adaprox, dict(all_args, **adaprox_args, scheme="amsgrad"), "AMSGrad"),
+    )
+
+    best_AS = None
+    best_loss = np.inf
+
+    for i, alpha in enumerate([0.01, 0.1]):
+        step = {
+            proxmin.pgm: proxmin.nmf.step_pgm,
+            proxmin.adaprox: lambda *X, it: (alpha, alpha),
+        }
+
+        for alg, kwargs, label in runs:
+            A = A0.copy()
+            S = S0.copy()
+            traceback.clear()
+            try:
+                c, G, V = alg((A, S), grad, step[alg], **kwargs)
+                loss = proxmin.nmf.log_likelihood(A, S, Y=Y)
+                print("{}: final loss = {}\n".format(label, loss))
+
+                if loss < best_loss:
+                    best_loss = loss
+                    best_AS = (A.copy(), S.copy())
+
+            except np.linalg.LinAlgError:
+                pass
+
+    A, S = match(*best_AS, trueS)
+    plotData(trueS, Y, S)

@@ -1,167 +1,203 @@
 from __future__ import print_function, division
 import numpy as np
+import scipy.sparse, scipy.sparse.linalg
 from . import operators
 from . import utils
 from . import algorithms
 
 import logging
+
 logger = logging.getLogger("proxmin")
 
-def delta_data(A, S, Y, W=1):
-    return W*(A.dot(S) - Y)
 
-def grad_likelihood_A(A, S, Y, W=1):
-    D = delta_data(A, S, Y, W=W)
-    return D.dot(S.T)
+def log_likelihood(*X, Y=0, W=1):
+    """Log-likelihood of NMF assuming Gaussian error model.
 
-def grad_likelihood_S(S, A, Y, W=1):
-    D = delta_data(A, S, Y, W=W)
-    return A.T.dot(D)
+    Args:
+        X:  tuple of (A,S) matrix factors
+        Y:  target matrix
+        W: (optional weight matrix MxN)
 
-# executes one proximal step of likelihood gradient, followed by prox_g
-def prox_likelihood_A(A, step, S=None, Y=None, prox_g=None, W=1):
-    return prox_g(A - step*grad_likelihood_A(A, S, Y, W=W), step)
+    Returns:
+        float
+    """
+    A, S = X
+    return np.sum(W * (Y - A.dot(S)) ** 2) / 2
 
-def prox_likelihood_S(S, step, A=None, Y=None, prox_g=None, W=1):
-    return prox_g(S - step*grad_likelihood_S(S, A, Y, W=W), step)
 
-def prox_likelihood(X, step, Xs=None, j=None, Y=None, WA=None, WS=None, prox_S=operators.prox_id, prox_A=operators.prox_id):
-    if j == 0:
-        return prox_likelihood_A(X, step, S=Xs[1], Y=Y, prox_g=prox_A, W=WA)
+def grad_likelihood(*X, Y=0, W=1):
+    """Gradient of the log-likelihood of NMF assuming Gaussian error model.
+
+    Args:
+        X:  tuple of (A,S) matrix factors
+        Y:  target matrix
+        W: (optional weight matrix MxN)
+
+    Returns:
+        grad_A f, grad_S f
+    """
+    A, S = X
+    D = W * (A.dot(S) - Y)
+    return D.dot(S.T), A.T.dot(D)
+
+
+def step_A(A, S):
+    return 1 / utils.get_spectral_norm(S.T)
+
+
+def step_S(A, S):
+    return 1 / utils.get_spectral_norm(A)
+
+
+def step_pgm(*X, it=None, W=1):
+    """Step sizes for PGM of NMF assuming Gaussian error model.
+
+    Args:
+        X:  tuple of (A,S) matrix factors
+        it:  iteration counter
+        W: (optional weight matrix MxN)
+
+    Returns:
+        step_A, step_S
+    """
+    A, S = X
+    if W is 1:
+        return step_A(A, S), step_S(A, S)
     else:
-        return prox_likelihood_S(X, step, A=Xs[0], Y=Y, prox_g=prox_S, W=WS)
+        C, K = A.shape
+        K, N = S.shape
+        Sigma_1 = scipy.sparse.diags(W.flatten())
 
-class Steps_AS:
-    def __init__(self, WA=1, WS=1, slack=0.1, max_stride=100):
-        """Helper class to compute the Lipschitz constants of grad f.
+        # Lipschitz constant for grad_A = || S Sigma_1 S.T||_s
+        PS = scipy.sparse.block_diag([S.T for c in range(C)])
+        SSigma_1S = PS.T.dot(Sigma_1.dot(PS))
+        LA = np.real(
+            scipy.sparse.linalg.eigs(SSigma_1S, k=1, return_eigenvectors=False)[0]
+        )
 
-        The __call__ function compute the spectral norms of A or S, which
-        determine the Lipschitz constant of the respective update steps.
+        # Lipschitz constant for grad_S = || A.T Sigma_1 A||_s
+        PA = scipy.sparse.bmat(
+            [[scipy.sparse.identity(N) * A[c, k] for k in range(K)] for c in range(C)]
+        )
+        ASigma_1A = PA.T.dot(Sigma_1.dot(PA))
+        LS = np.real(
+            scipy.sparse.linalg.eigs(ASigma_1A, k=1, return_eigenvectors=False)[0]
+        )
+        LA, LS
 
-        If a weight matrix is used, the stepsize will be upper bounded by
-        assuming the maximum value of the weights. In the case of varying
-        weights, it is generally advised to normalize the weight matrix
-        differently for the A and S updates, therefore two maximum numbers
-        (WAMax, WSmax) can be set.
+        return 1 / LA, 1 / LS
 
-        Because the spectral norm is expensive to compute, it will only update
-        the step_size if relative changes of L exceed slack/2.
-        If not, which is usually the case after only a few iterations, it will
-        report a previous value for the next several iterations. The stride
-        between updates is set by
-            stride -> stride * (slack/2 / rel_error
-        i.e. it increases more strongly if the rel_error is much below the
-        slack budget.
-        """
-        import scipy.sparse
-        if WA is 1:
-            self.WA = WA
-        else:
-            self.WA = scipy.sparse.diags(WA.reshape(-1))
-        if WS is 1:
-            self.WS = WS
-        else:
-            self.WS = scipy.sparse.diags(WS.reshape(-1))
 
-        # two independent caches for Lipschitz constants
-        self._cb = [utils.ApproximateCache(self._one_over_lipschitzA, slack=slack, max_stride=max_stride),
-                    utils.ApproximateCache(self._one_over_lipschitzS, slack=slack, max_stride=max_stride)]
+def step_adaprox(*X, it=None):
+    A, S = X
+    return (np.mean(A, axis=0) / 10, S.mean(axis=1)[:, None] / 10)
 
-    def _one_over_lipschitzA(self, Xs):
-        A,S = Xs
-        if self.WA is 1:
-            return 1./utils.get_spectral_norm(S.T)
-        else: # full weight matrix, need to serialize S along k
-            import scipy.sparse
-            Ss = scipy.sparse.block_diag([S.T for b in range(len(A))])
-            # Lipschitz constant for grad_A = || S Sigma_1 S.T||_s
-            SSigma_1S = Ss.T.dot(self.WA.dot(Ss))
-            LA = np.real(scipy.sparse.linalg.eigs(SSigma_1S, k=1, return_eigenvectors=False)[0])
-            return 1./LA
 
-    def _one_over_lipschitzS(self, Xs):
-        A,S = Xs
-        if self.WA is 1:
-            return 1./utils.get_spectral_norm(A)
-        else:
-            import scipy.sparse
-            N = S.shape[1]
-            As = scipy.sparse.bmat([[scipy.sparse.identity(N) * A[b,k] for k in range(A.shape[1])] for b in range(A.shape[0])])
-            ASigma_1A = As.T.dot(self.WS.dot(As))
-            LS = np.real(scipy.sparse.linalg.eigs(ASigma_1A, k=1, return_eigenvectors=False)[0])
-            return 1./LS
-
-    def __call__(self, j, Xs):
-        return self._cb[j](Xs)
-
-def normalizeMatrix(M, axis):
-    if axis == 1:
-        norm = np.sum(M, axis=axis)
-        norm = np.broadcast_to(norm, M.T.shape)
-        norm = norm.T
-    else:
-        norm = np.sum(M, axis=axis)
-        norm = np.broadcast_to(norm, M.shape)
-    return norm
-
-def nmf(Y, A, S, W=None, prox_A=operators.prox_plus, prox_S=operators.prox_plus, proxs_g=None, steps_g=None, Ls=None, slack=0.9, update_order=None, steps_g_update='steps_f', max_iter=1000, e_rel=1e-3, e_abs=0, traceback=None):
+def nmf(
+    Y,
+    A,
+    S,
+    W=1,
+    prox_A=operators.prox_plus,
+    prox_S=operators.prox_plus,
+    algorithm=algorithms.pgm,
+    step=None,
+    max_iter=1000,
+    e_rel=1e-3,
+    callback=None,
+    **algorithm_args
+):
     """Non-negative matrix factorization.
 
-    This method solves the NMF problem
+    This method solves the matrix factorization problem
         minimize || Y - AS ||_2^2
     under an arbitrary number of constraints on A and/or S.
 
     Args:
-        Y:  target matrix MxN
+        Y: target matrix MxN
         A: initial amplitude matrix MxK, will be updated
         S: initial source matrix KxN, will be updated
         W: (optional weight matrix MxN)
-        prox_A: direct projection contraint of A
-        prox_S: direct projection constraint of S
-        proxs_g: list of constraints for A or S for ADMM-type optimization
-            [[prox_A_0, prox_A_1...],[prox_S_0, prox_S_1,...]]
-        steps_g: specific value of step size for proxs_g (experts only!)
-        Ls: list of linear operators for the constraint functions proxs_g
-            If set, needs to have same format as proxs_g.
-            Matrices can be numpy.array, scipy.sparse, or None (for identity).
-        slack: tolerance for (re)evaluation of Lipschitz constants
-            See Steps_AS() for details.
-        update_order: list of factor indices in update order
-            j=0 -> A, j=1 -> S
+        prox_A: direct contraint of A
+        prox_S: direct constraint of S
+        algorithm: an algorithm from `proxmin.algorithms`
+        step: function to compute step sizes for A and S
+            Signature: step(*X, it)
         max_iter: maximum iteration number, irrespective of current residuals
         e_rel: relative error threshold for primal and dual residuals
-        e_abs: absolute error threshold for primal and dual residuals
-        traceback: utils.Traceback to hold variable histories
+        callback: arbitrary logging function
+            Signature: callback(*X, it=None)
+        algorithm_args: further arguments passed to the algorithm
 
     Returns:
-        converged: convence test for A,S
-        errors: difference between latest and previous iterations for A,S
-
-    See also:
-        algorithms.bsdmm for update_order and steps_g_update
-        utils.AcceleratedProxF for Nesterov acceleration
+        return arguments of algorithm
+        A, S are updated inline
 
     Reference:
-        Moolekamp & Melchior, 2017 (arXiv:1708.09066)
+        Moolekamp & Melchior, 2018 (arXiv:1708.09066)
 
     """
 
-    # create stepsize callback, needs max of W
-    if W is not None:
-        # normalize in pixel and band directions to have similar update speeds
-        WA = normalizeMatrix(W, 1)
-        WS = normalizeMatrix(W, 0)
-    else:
-        WA = WS = 1
-    steps_f = Steps_AS(WA=WA, WS=WS, slack=slack)
+    assert algorithm in [algorithms.pgm, algorithms.adaprox, algorithms.bsdmm]
 
-    # gradient step, followed by direct application of prox_S or prox_A
+    # setup
     from functools import partial
-    f = partial(prox_likelihood, Y=Y, WA=WA, WS=WS, prox_S=prox_S, prox_A=prox_A)
 
+    grad = partial(grad_likelihood, Y=Y, W=W)
     X = [A, S]
-    # use accelerated block-PGM if there's no proxs_g
-    if proxs_g is None or not utils.hasNotNone(proxs_g):
-        return algorithms.bpgm(X, f, steps_f, accelerated=True, update_order=update_order, max_iter=max_iter, e_rel=e_rel, traceback=traceback)
-    else:
-        return algorithms.bsdmm(X, f, steps_f, proxs_g, steps_g=steps_g, Ls=Ls, update_order=update_order, steps_g_update=steps_g_update, max_iter=max_iter, e_rel=e_rel, e_abs=e_abs, traceback=traceback)
+    prox = [prox_A, prox_S]
+
+    if algorithm is algorithms.pgm:
+        if step is None:
+            step = partial(step_pgm, W=W)
+        return algorithm(
+            X,
+            grad,
+            step,
+            prox=prox,
+            max_iter=max_iter,
+            e_rel=e_rel,
+            callback=callback,
+            **algorithm_args
+        )
+
+    if algorithm is algorithms.adaprox:
+        if step is None:
+            step = step_adaprox
+        return algorithm(
+            X,
+            grad,
+            step,
+            prox=prox,
+            max_iter=max_iter,
+            e_rel=e_rel,
+            callback=callback,
+            **algorithm_args
+        )
+
+    if algorithm is algorithms.bsdmm:
+
+        # transform gradient steps into prox
+        def prox_f(X, step, Xs=None, j=None):
+            # that's a bit of a waste since we compute all gradients
+            grads = grad(*Xs)
+            # ...but only use one
+            return prox[j](X - step * grads[j], step)
+
+        if step is None:
+            step_ = partial(step_pgm, W=W)
+
+            def step_f(Xs, j=None):
+                return step_(*Xs)[j]
+
+            step = step_f
+
+        return algorithms.bsdmm(
+            X,
+            prox_f,
+            step_f,
+            max_iter=max_iter,
+            e_rel=e_rel,
+            callback=callback,
+            **algorithm_args
+        )

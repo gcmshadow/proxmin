@@ -1,5 +1,4 @@
+from .algorithms import *
+from .operators import *
+from . import nmf
 from . import utils
-from . import algorithms
-from . import operators
-
-from .nmf import nmf as nmf
